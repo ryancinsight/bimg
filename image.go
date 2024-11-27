@@ -172,3 +172,9 @@ func (i *Image) Type() string {
 func (i *Image) Size() (ImageSize, error) {
 	return Size(i.buffer)
 }
+
+// AutoRotate automatically rotates the image with no additional transformation 
+// based on the EXIF orientation metadata, if available.
+func (i *Image) AutoRotate() ([]byte, error) {
+    return i.Process(Options{autoRotateOnly: true})
+}
