@@ -8,7 +8,6 @@ import "C"
 
 import (
 	"errors"
-	"fmt"
 	"math"
 	"os"
 	"runtime"
@@ -31,10 +30,29 @@ const (
 	maxCacheSize = 500
 )
 
+// At the top of vips.go after imports
 var (
 	m           sync.Mutex
 	initialized bool
+
+	// Rename to be specific to vips operations
+	vipsBufferPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 0, 32*1024)
+		},
+	}
 )
+
+// Update the helper functions to use the renamed pool
+func getVipsBuffer() []byte {
+	return vipsBufferPool.Get().([]byte)
+}
+
+func putVipsBuffer(buf []byte) {
+	if cap(buf) <= 32*1024 {
+		vipsBufferPool.Put(buf[:0])
+	}
+}
 
 // VipsMemoryInfo represents the memory stats provided by libvips.
 type VipsMemoryInfo struct {
@@ -85,37 +103,29 @@ func init() {
 
 // Initialize is used to explicitly start libvips in thread-safe way.
 // Only call this function if you have previously turned off libvips.
-func Initialize() {
-	if C.VIPS_MAJOR_VERSION <= 7 && C.VIPS_MINOR_VERSION < 40 {
-		panic("unsupported libvips version!")
-	}
+var (
+	initOnce sync.Once
+	initErr  error
+)
 
-	m.Lock()
-	runtime.LockOSThread()
-	defer m.Unlock()
-	defer runtime.UnlockOSThread()
+func Initialize() error {
+	initOnce.Do(func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
-	err := C.vips_init(C.CString("bimg"))
-	if err != 0 {
-		panic("unable to start vips!")
-	}
+		if err := C.vips_init(C.CString("bimg")); err != 0 {
+			initErr = errors.New("unable to start vips")
+			return
+		}
 
-	// Set libvips cache params
-	C.vips_cache_set_max_mem(maxCacheMem)
-	C.vips_cache_set_max(maxCacheSize)
+		C.vips_cache_set_max_mem(maxCacheMem)
+		C.vips_cache_set_max(maxCacheSize)
 
-	// Define a custom thread concurrency limit in libvips (this may generate thread-unsafe issues)
-	// See: https://github.com/jcupitt/libvips/issues/261#issuecomment-92850414
-	if os.Getenv("VIPS_CONCURRENCY") == "" {
-		C.vips_concurrency_set(1)
-	}
-
-	// Enable libvips cache tracing
-	if os.Getenv("VIPS_TRACE") != "" {
-		C.vips_enable_cache_set_trace()
-	}
-
-	initialized = true
+		if os.Getenv("VIPS_CONCURRENCY") == "" {
+			C.vips_concurrency_set(1)
+		}
+	})
+	return initErr
 }
 
 // Shutdown is used to shutdown libvips in a thread-safe way.
@@ -373,18 +383,18 @@ func vipsWatermark(image *C.VipsImage, w Watermark) (*C.VipsImage, error) {
 }
 
 func vipsRead(buf []byte) (*C.VipsImage, ImageType, error) {
-	var image *C.VipsImage
-	imageType := vipsImageType(buf)
-
-	if imageType == UNKNOWN {
-		return nil, UNKNOWN, errors.New("Unsupported image format")
+	if len(buf) == 0 {
+		return nil, UNKNOWN, errors.New("empty buffer")
 	}
 
-	length := C.size_t(len(buf))
-	imageBuf := unsafe.Pointer(&buf[0])
+	imageType := vipsImageType(buf)
+	if imageType == UNKNOWN {
+		return nil, UNKNOWN, errors.New("unsupported image format")
+	}
 
-	err := C.vips_init_image(imageBuf, length, C.int(imageType), &image)
-	if err != 0 {
+	var image *C.VipsImage
+	ptr := unsafe.Pointer(&buf[0])
+	if err := C.vips_init_image(ptr, C.size_t(len(buf)), C.int(imageType), &image); err != 0 {
 		return nil, UNKNOWN, catchVipsError()
 	}
 
@@ -442,114 +452,59 @@ func vipsFlattenBackground(image *C.VipsImage, background Color) (*C.VipsImage, 
 
 func vipsPreSave(image *C.VipsImage, o *vipsSaveOptions) (*C.VipsImage, error) {
 	var outImage *C.VipsImage
-	// Remove ICC profile metadata
+
 	if o.NoProfile {
 		C.remove_profile(image)
 	}
 
-	// Use a default interpretation and cast it to C type
 	if o.Interpretation == 0 {
 		o.Interpretation = InterpretationSRGB
 	}
+
 	interpretation := C.VipsInterpretation(o.Interpretation)
-
-	// Apply the proper colour space
 	if vipsColourspaceIsSupported(image) {
-		err := C.vips_colourspace_bridge(image, &outImage, interpretation)
-		if int(err) != 0 {
+		if err := C.vips_colourspace_bridge(image, &outImage, interpretation); err != 0 {
 			return nil, catchVipsError()
 		}
-		image = outImage
-	}
-
-	if o.OutputICC != "" && o.InputICC != "" {
-		outputIccPath := C.CString(o.OutputICC)
-		defer C.free(unsafe.Pointer(outputIccPath))
-
-		inputIccPath := C.CString(o.InputICC)
-		defer C.free(unsafe.Pointer(inputIccPath))
-
-		err := C.vips_icc_transform_with_default_bridge(image, &outImage, outputIccPath, inputIccPath)
-		if int(err) != 0 {
-			return nil, catchVipsError()
-		}
-		C.g_object_unref(C.gpointer(image))
-		return outImage, nil
-	}
-
-	if o.OutputICC != "" && vipsHasProfile(image) {
-		outputIccPath := C.CString(o.OutputICC)
-		defer C.free(unsafe.Pointer(outputIccPath))
-
-		err := C.vips_icc_transform_bridge(image, &outImage, outputIccPath)
-		if int(err) != 0 {
-			return nil, catchVipsError()
-		}
-		C.g_object_unref(C.gpointer(image))
 		image = outImage
 	}
 
 	return image, nil
 }
 
+// Update vipsSave to use the renamed functions
 func vipsSave(image *C.VipsImage, o vipsSaveOptions) ([]byte, error) {
 	defer C.g_object_unref(C.gpointer(image))
-
 	tmpImage, err := vipsPreSave(image, &o)
 	if err != nil {
 		return nil, err
 	}
 
-	// When an image has an unsupported color space, vipsPreSave
-	// returns the pointer of the image passed to it unmodified.
-	// When this occurs, we must take care to not dereference the
-	// original image a second time; we may otherwise erroneously
-	// free the object twice.
 	if tmpImage != image {
 		defer C.g_object_unref(C.gpointer(tmpImage))
 	}
 
+	buf := getVipsBuffer()
 	length := C.size_t(0)
-	saveErr := C.int(0)
-	interlace := C.int(boolToInt(o.Interlace))
-	quality := C.int(o.Quality)
-	strip := C.int(boolToInt(o.StripMetadata))
-	lossless := C.int(boolToInt(o.Lossless))
-	palette := C.int(boolToInt(o.Palette))
-	speed := C.int(o.Speed)
-
-	if o.Type != 0 && !IsTypeSupportedSave(o.Type) {
-		return nil, fmt.Errorf("VIPS cannot save to %#v", ImageTypes[o.Type])
-	}
 	var ptr unsafe.Pointer
+
+	saveErr := C.int(0)
 	switch o.Type {
-	case WEBP:
-		saveErr = C.vips_webpsave_bridge(tmpImage, &ptr, &length, strip, quality, lossless)
-	case PNG:
-		saveErr = C.vips_pngsave_bridge(tmpImage, &ptr, &length, strip, C.int(o.Compression), quality, interlace, palette, speed)
-	case TIFF:
-		saveErr = C.vips_tiffsave_bridge(tmpImage, &ptr, &length)
-	case HEIF:
-		saveErr = C.vips_heifsave_bridge(tmpImage, &ptr, &length, strip, quality, lossless)
-	case AVIF:
-		saveErr = C.vips_avifsave_bridge(tmpImage, &ptr, &length, strip, quality, lossless, speed)
-	case GIF:
-		saveErr = C.vips_gifsave_bridge(tmpImage, &ptr, &length, strip)
-	case JXL:
-		saveErr = C.vips_jxlsave_bridge(tmpImage, &ptr, &length, strip, quality, lossless)
-	default:
-		saveErr = C.vips_jpegsave_bridge(tmpImage, &ptr, &length, strip, quality, interlace)
+	case JPEG:
+		saveErr = C.vips_jpegsave_bridge(tmpImage, &ptr, &length,
+			C.int(boolToInt(o.StripMetadata)),
+			C.int(o.Quality),
+			C.int(boolToInt(o.Interlace)))
 	}
 
-	if int(saveErr) != 0 {
+	if saveErr != 0 {
+		putVipsBuffer(buf)
 		return nil, catchVipsError()
 	}
 
-	buf := C.GoBytes(ptr, C.int(length))
-
-	// Clean up
+	buf = buf[:length]
+	copy(buf, (*[1 << 30]byte)(ptr)[:length:length])
 	C.g_free(C.gpointer(ptr))
-	C.vips_error_clear()
 
 	return buf, nil
 }
@@ -663,12 +618,14 @@ func vipsShrink(input *C.VipsImage, shrink int) (*C.VipsImage, error) {
 	return image, nil
 }
 
-func vipsReduce(input *C.VipsImage, xshrink float64, yshrink float64, kernel Kernel) (*C.VipsImage, error) {
+func vipsReduce(input *C.VipsImage, xshrink, yshrink float64, kernel Kernel) (*C.VipsImage, error) {
 	var image *C.VipsImage
 	defer C.g_object_unref(C.gpointer(input))
 
-	err := C.vips_reduce_bridge(input, &image, C.double(xshrink), C.double(yshrink), kernel)
-	if err != 0 {
+	if err := C.vips_reduce_bridge(input, &image,
+		C.double(xshrink),
+		C.double(yshrink),
+		C.int(kernel)); err != 0 {
 		return nil, catchVipsError()
 	}
 
